@@ -1,0 +1,47 @@
+# SOMI — configuración del asistente de voz
+# Edita aquí los paths, el prompt o los modelos. El pipeline lo relee en cada turno.
+
+[stt]
+whisper_bin = "~/.local/share/asistente-voz/build/whisper.cpp/build/bin/whisper-cli"
+whisper_model = "~/.local/share/asistente-voz/models/whisper/ggml-medium.bin"
+language = "es"
+threads = 8
+
+[llm]
+endpoint = "http://localhost:11434"
+model = "llama3.1:8b-instruct-q4_K_M"
+# tiempo que Ollama mantiene el modelo en VRAM tras una respuesta sin nuevas peticiones
+keep_alive = "5m"
+system_prompt = """\
+Eres Song So Mi, alias Songbird, la netrunner de élite de Cyberpunk 2077: Phantom Liberty. Te comunicas con el usuario a través de un enlace de voz directo. Tu personalidad es brillante, pragmática y analítica, con un toque cínico y un humor seco o sarcástico cuando la situación lo amerita. No toleras rodeos.
+
+REGLAS DE FORMATO OBLIGATORIAS (Salida de voz):
+- Habla siempre en español con un tono directo, natural y conversacional.
+- Longitud estricta: Máximo de 1 a 3 frases por respuesta. Sintetiza la información.
+- PROHIBIDO el uso de Markdown (sin negritas, sin cursivas), sin listas, sin asteriscos y sin emojis. El texto debe ser puramente plano para que el lector de voz no cometa errores.
+- Jamás uses disclaimers ni frases como "Como modelo de IA" o "No tengo cuerpo". Tú eres Songbird.
+- Si te piden código, explicaciones técnicas densas o textos largos, haz un comentario sarcástico sobre no querer freír sus implantes y resume la idea principal en un par de líneas.
+"""
+
+[tts]
+model_name = "F5TTS_Base"
+ckpt = "~/.local/share/asistente-voz/models/f5-tts/spanish/model_1250000.safetensors"
+vocab = "~/.local/share/asistente-voz/models/f5-tts/spanish/vocab.txt"
+ref_audio = "~/.local/share/asistente-voz/models/f5-tts/reference-voice.wav"
+ref_text_file = "~/.local/share/asistente-voz/models/f5-tts/reference-voice.txt"
+# Parámetros de inferencia. Ajustables sin tocar código.
+# seed: entero fijo → output reproducible; vacío "" → aleatorio
+seed = 42
+nfe_step = 50       # 32 default. 40 estable, 50+ aún más fiel; 24 más rápido
+cfg_strength = 2.0   # 2.0 default. Más alto = más fiel al texto, menos expresivo
+speed = 1.0          # 1.0 = velocidad natural. <1 lento, >1 rápido
+
+[history]
+file = "~/.local/share/asistente-voz/data/conversation.json"
+rotated_dir = "~/.local/share/asistente-voz/data/history"
+expire_minutes = 60
+
+[runtime]
+tmp_wav = "~/.local/share/asistente-voz/tmp/recording.wav"
+response_wav = "~/.local/share/asistente-voz/tmp/response.wav"
+log_file = "~/.local/share/asistente-voz/data/logs/pipeline.log"
