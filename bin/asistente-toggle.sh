@@ -56,11 +56,35 @@ cancel_pipeline() {
     fi
     log "cancel: SIGTERM al pgid $pgid"
     kill -TERM -- "-$pgid" 2>/dev/null || true
-    sleep 0.15
+    # Espera 2s para que el pipeline pueda hacer cleanup (e.g. unload del LLM)
+    local i=0
+    while kill -0 -- "-$pgid" 2>/dev/null && (( i < 20 )); do
+        sleep 0.1
+        i=$((i+1))
+    done
     if kill -0 -- "-$pgid" 2>/dev/null; then
         log "cancel: SIGKILL al pgid $pgid"
         kill -KILL -- "-$pgid" 2>/dev/null || true
     fi
+    # Descargar el LLM de VRAM para que whisper pueda cargar en el próximo turno
+    _ollama_unload_bg
+}
+
+_ollama_unload_bg() {
+    # Lanza en background un script Python que solicita keep_alive=0 a Ollama
+    "$VENV_PYTHON" - <<'PYEOF' &
+import sys, tomllib, urllib.request, json, os
+try:
+    cfg_path = os.path.expanduser("~/Documents/projects/python/SOMI/config.toml")
+    with open(cfg_path, "rb") as f:
+        cfg = tomllib.load(f)
+    body = json.dumps({"model": cfg["llm"]["model"], "keep_alive": 0}).encode()
+    req = urllib.request.Request(cfg["llm"]["endpoint"] + "/api/generate",
+                                  data=body, method="POST")
+    urllib.request.urlopen(req, timeout=5)
+except Exception:
+    pass
+PYEOF
 }
 
 start_recording() {

@@ -1,0 +1,28 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//home/penguin/night_city/**)",
+      "Bash(~/.local/share/asistente-voz/venv/bin/python *)",
+      "Bash(~/.local/share/asistente-voz/venv/bin/pip install *)",
+      "Bash(claude --version)",
+      "Bash(gemini --version)",
+      "Bash(claude -p \"hola\")",
+      "Bash(echo \"EXIT: $?\")",
+      "Bash(gemini --help)",
+      "Bash(gemini -p \"hola\")",
+      "Bash(timeout 30 claude -p \"¿Cuánto es 2+2? Responde solo el número.\")",
+      "Bash(bash -n /home/penguin/Documents/projects/python/SOMI/bin/asistente-toggle.sh)",
+      "Bash(eww --version)",
+      "Bash(python3 -c \"import gi; gi.require_version\\('Gtk','4.0'\\); from gi.repository import Gtk; print\\('GTK4 ok'\\)\")",
+      "Bash(python3 -c \"import gi; gi.require_version\\('Gtk','3.0'\\); from gi.repository import Gtk; print\\('GTK3 ok'\\)\")",
+      "Bash(pacman -Q python-gobject)",
+      "Bash(pacman -Q gtk4)",
+      "Bash(pacman -Q gtk3)",
+      "Bash(~/.local/share/asistente-voz/venv/bin/pip list *)",
+      "Bash(notify-send --version)",
+      "Bash(pacman -Q libnotify)",
+      "Read(//usr/share/icons/**)",
+      "Bash(~/.local/share/asistente-voz/venv/bin/pip3 install *)"
+    ]
+  }
+}

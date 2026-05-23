@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -18,6 +19,9 @@ import urllib.error
 import urllib.request
 from datetime import datetime
 from pathlib import Path
+
+# Hace importable el directorio tools/ que está en la raíz del proyecto
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 CONFIG_PATH = Path(__file__).parent.parent / "config.toml"
 TTS_SOCKET = "/tmp/somi-tts.sock"
@@ -140,17 +144,76 @@ def _http_post(url: str, body: dict, timeout: int = 120) -> dict:
 def llm_chat(history: list[dict], user_text: str, cfg: dict, log) -> str:
     history.append({"role": "user", "content": user_text})
     messages = [{"role": "system", "content": cfg["llm"]["system_prompt"]}] + history
-    payload = {
+
+    payload: dict = {
         "model": cfg["llm"]["model"],
         "messages": messages,
         "stream": False,
         "keep_alive": cfg["llm"]["keep_alive"],
     }
-    log(f"LLM: msgs={len(messages)} user='{user_text[:80]}'")
+
+    tools_habilitado = cfg.get("tools", {}).get("habilitado", False)
+    if tools_habilitado:
+        from tools.registry import schemas_para_ollama, ejecutar_tool
+        payload["tools"] = schemas_para_ollama()
+
+    log(f"LLM: msgs={len(messages)} user='{user_text[:80]}' tools={tools_habilitado}")
     t0 = time.monotonic()
     resp = _http_post(cfg["llm"]["endpoint"] + "/api/chat", payload)
     log(f"LLM elapsed={time.monotonic() - t0:.2f}s")
-    content = resp["message"]["content"].strip()
+
+    msg = resp["message"]
+    tool_calls: list = msg.get("tool_calls") or []
+
+    if tools_habilitado and tool_calls:
+        # Guarda el turno del asistente con sus tool_calls en el historial
+        history.append({
+            "role": "assistant",
+            "content": msg.get("content") or "",
+            "tool_calls": tool_calls,
+        })
+
+        for llamada in tool_calls:
+            nombre = llamada["function"]["name"]
+            args = llamada["function"]["arguments"]
+            if isinstance(args, str):
+                args = json.loads(args)
+            log(f"TOOL: {nombre} args={args}")
+            if nombre == "consultar_experto":
+                experto = args.get("experto", "claude") if isinstance(args, dict) else "experto"
+                notify(f"🤖 Consultando a {experto}...", "Puede tardar hasta un minuto")
+            resultado = ejecutar_tool(nombre, args, cfg)
+            log(f"TOOL: {nombre} -> status={resultado.get('status')}")
+            # Cuando hay error lo expresamos en lenguaje natural para que el modelo
+            # no lo ignore — Llama 3.1 tiende a pasar por alto el campo status=error
+            if resultado.get("status") == "error":
+                tool_content = (
+                    f"La herramienta {nombre} falló con el siguiente error: "
+                    f"{resultado.get('message', 'error desconocido')}. "
+                    f"Informa al usuario de que no se pudo guardar."
+                )
+            else:
+                tool_content = json.dumps(resultado, ensure_ascii=False)
+            history.append({
+                "role": "tool",
+                "content": tool_content,
+            })
+
+        # Segunda llamada: el modelo genera la confirmación verbal
+        messages2 = [{"role": "system", "content": cfg["llm"]["system_prompt"]}] + history
+        payload2 = {
+            "model": cfg["llm"]["model"],
+            "messages": messages2,
+            "stream": False,
+            "keep_alive": cfg["llm"]["keep_alive"],
+        }
+        t1 = time.monotonic()
+        resp2 = _http_post(cfg["llm"]["endpoint"] + "/api/chat", payload2)
+        log(f"LLM (confirmación) elapsed={time.monotonic() - t1:.2f}s")
+        content = resp2["message"]["content"].strip()
+    else:
+        content = msg["content"].strip()
+
     history.append({"role": "assistant", "content": content})
     return content
 
@@ -296,11 +359,18 @@ def _synthesize_cold(text: str, cfg: dict, log, out_path: Path, ref_text: str) -
 
 def synthesize(text: str, cfg: dict, log) -> Path | None:
     """Genera audio. Intenta daemon primero, cae a cold-start si no responde."""
+    from text_tts import normalizar_para_tts
+
     ref_text = Path(expand(cfg["tts"]["ref_text_file"])).read_text(encoding="utf-8").strip()
     out_path = Path(expand(cfg["runtime"]["response_wav"]))
     out_path.parent.mkdir(parents=True, exist_ok=True)
     if out_path.exists():
         out_path.unlink()
+
+    text_norm = normalizar_para_tts(text)
+    if text_norm != text:
+        log(f"TTS normalizado: '{text_norm[:80]}'")
+    text = text_norm
 
     result = _synthesize_via_daemon(text, cfg, log, out_path, ref_text)
     if result is not None:
@@ -309,8 +379,44 @@ def synthesize(text: str, cfg: dict, log) -> Path | None:
     return _synthesize_cold(text, cfg, log, out_path, ref_text)
 
 
+_OVERLAY_SCRIPT = Path(__file__).parent.parent / "overlay" / "somi-overlay.py"
+_LAYER_SHELL_SO  = "/usr/lib/libgtk4-layer-shell.so"
+
+
 def play(wav: Path) -> None:
+    overlay = _launch_overlay()
     subprocess.run(["paplay", str(wav)], check=False)
+    _kill_overlay(overlay)
+
+
+def _launch_overlay() -> subprocess.Popen | None:
+    if not _OVERLAY_SCRIPT.exists():
+        return None
+    try:
+        env = os.environ.copy()
+        # gtk4-layer-shell debe preceder a libwayland en el linker
+        if Path(_LAYER_SHELL_SO).exists():
+            env["LD_PRELOAD"] = _LAYER_SHELL_SO
+        proc = subprocess.Popen(
+            [sys.executable, str(_OVERLAY_SCRIPT)],
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        time.sleep(0.25)   # margen para que la ventana aparezca
+        return proc
+    except Exception:
+        return None
+
+
+def _kill_overlay(proc: subprocess.Popen | None) -> None:
+    if proc is None or proc.poll() is not None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        proc.kill()
 
 
 # --------- main ---------
@@ -325,6 +431,16 @@ def main() -> int:
 
     cfg = load_config()
     log = _log_writer(Path(expand(cfg["runtime"]["log_file"])))
+
+    # SIGTERM handler: libera VRAM antes de morir (Alt+Z durante el pipeline)
+    def _on_sigterm(signum, frame):
+        log("SIGTERM recibido — unload LLM y salida")
+        try:
+            llm_unload(cfg, log)
+        except Exception:
+            pass
+        sys.exit(0)
+    signal.signal(signal.SIGTERM, _on_sigterm)
     t_start = time.monotonic()
     log("==================== turn start ====================")
 
