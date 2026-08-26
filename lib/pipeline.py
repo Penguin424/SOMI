@@ -15,13 +15,13 @@ import subprocess
 import sys
 import time
 import tomllib
-import urllib.error
-import urllib.request
 from datetime import datetime
 from pathlib import Path
 
 # Hace importable el directorio tools/ que está en la raíz del proyecto
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+import llm_client
 
 CONFIG_PATH = Path(__file__).parent.parent / "config.toml"
 TTS_SOCKET = "/tmp/somi-tts.sock"
@@ -119,11 +119,30 @@ def load_history(cfg: dict, log) -> list[dict]:
     try:
         with open(hist_file, encoding="utf-8") as f:
             data = json.load(f)
+        if _es_formato_ollama_viejo(data):
+            rot_dir = Path(expand(cfg["history"]["rotated_dir"]))
+            rot_dir.mkdir(parents=True, exist_ok=True)
+            target = rot_dir / f"conversation-{datetime.now().strftime('%Y%m%d-%H%M%S')}.json"
+            shutil.move(str(hist_file), str(target))
+            log(f"history: formato Ollama antiguo detectado, rotado -> {target.name}")
+            return []
         log(f"history: loaded {len(data)} messages (age {age_min:.1f}min)")
         return data
     except Exception as e:
         log(f"history: corrupt ({e}), starting fresh")
         return []
+
+
+def _es_formato_ollama_viejo(data: list[dict]) -> bool:
+    """Detecta historiales guardados antes de migrar a LM Studio: los mensajes
+    de tool_calls/tool ahí no llevan "id"/"tool_call_id" (la API OpenAI sí los exige)."""
+    for msg in data:
+        if msg.get("role") == "assistant" and msg.get("tool_calls"):
+            if any("id" not in tc for tc in msg["tool_calls"]):
+                return True
+        if msg.get("role") == "tool" and "tool_call_id" not in msg:
+            return True
+    return False
 
 
 def save_history(history: list[dict], cfg: dict) -> None:
@@ -133,40 +152,55 @@ def save_history(history: list[dict], cfg: dict) -> None:
         json.dump(history, f, ensure_ascii=False, indent=2)
 
 
-# --------- LLM (Ollama) ---------
-def _http_post(url: str, body: dict, timeout: int = 120) -> dict:
-    data = json.dumps(body).encode("utf-8")
-    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read())
+_DIAS_ES = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"]
+_MESES_ES = [
+    "enero", "febrero", "marzo", "abril", "mayo", "junio",
+    "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre",
+]
 
 
+def _system_prompt_con_fecha(cfg: dict) -> str:
+    """Inyecta la fecha/hora actual en el system prompt.
+
+    Sin esto, tools como agregar_pendiente/calificar_media (que piden fechas
+    en YYYY-MM-DD) no tienen forma de resolver expresiones relativas como
+    "mañana": el modelo se queda deliberando cómo calcular la fecha y termina
+    abandonando la llamada a la tool, devolviendo solo una confirmación
+    verbal sin haber guardado nada."""
+    ahora = datetime.now()
+    dia_semana = _DIAS_ES[ahora.weekday()]
+    mes = _MESES_ES[ahora.month - 1]
+    fecha_legible = f"{dia_semana} {ahora.day} de {mes} de {ahora.year}"
+    linea_fecha = (
+        f"\n\nFecha y hora actual: {fecha_legible}, {ahora.strftime('%H:%M')} "
+        f"(ISO: {ahora.strftime('%Y-%m-%d')}). Úsala para calcular fechas relativas "
+        f'como "mañana", "el viernes" o "la próxima semana" en formato YYYY-MM-DD.'
+    )
+    return cfg["llm"]["system_prompt"] + linea_fecha
+
+
+# --------- LLM (LM Studio remoto) ---------
 def llm_chat(history: list[dict], user_text: str, cfg: dict, log) -> str:
     history.append({"role": "user", "content": user_text})
-    messages = [{"role": "system", "content": cfg["llm"]["system_prompt"]}] + history
-
-    payload: dict = {
-        "model": cfg["llm"]["model"],
-        "messages": messages,
-        "stream": False,
-        "keep_alive": cfg["llm"]["keep_alive"],
-    }
+    system_prompt = _system_prompt_con_fecha(cfg)
+    messages = [{"role": "system", "content": system_prompt}] + history
 
     tools_habilitado = cfg.get("tools", {}).get("habilitado", False)
+    tool_schemas = None
     if tools_habilitado:
         from tools.registry import schemas_para_ollama, ejecutar_tool
-        payload["tools"] = schemas_para_ollama()
+        tool_schemas = schemas_para_ollama()
 
     log(f"LLM: msgs={len(messages)} user='{user_text[:80]}' tools={tools_habilitado}")
     t0 = time.monotonic()
-    resp = _http_post(cfg["llm"]["endpoint"] + "/api/chat", payload)
+    msg = llm_client.chat(messages, cfg, log, tools=tool_schemas)
     log(f"LLM elapsed={time.monotonic() - t0:.2f}s")
 
-    msg = resp["message"]
     tool_calls: list = msg.get("tool_calls") or []
 
     if tools_habilitado and tool_calls:
         # Guarda el turno del asistente con sus tool_calls en el historial
+        # (formato OpenAI: cada llamada trae su propio "id")
         history.append({
             "role": "assistant",
             "content": msg.get("content") or "",
@@ -185,7 +219,7 @@ def llm_chat(history: list[dict], user_text: str, cfg: dict, log) -> str:
             resultado = ejecutar_tool(nombre, args, cfg)
             log(f"TOOL: {nombre} -> status={resultado.get('status')}")
             # Cuando hay error lo expresamos en lenguaje natural para que el modelo
-            # no lo ignore — Llama 3.1 tiende a pasar por alto el campo status=error
+            # no lo ignore — algunos modelos tienden a pasar por alto el campo status=error
             if resultado.get("status") == "error":
                 tool_content = (
                     f"La herramienta {nombre} falló con el siguiente error: "
@@ -196,58 +230,22 @@ def llm_chat(history: list[dict], user_text: str, cfg: dict, log) -> str:
                 tool_content = json.dumps(resultado, ensure_ascii=False)
             history.append({
                 "role": "tool",
+                "tool_call_id": llamada["id"],
+                "name": nombre,
                 "content": tool_content,
             })
 
         # Segunda llamada: el modelo genera la confirmación verbal
-        messages2 = [{"role": "system", "content": cfg["llm"]["system_prompt"]}] + history
-        payload2 = {
-            "model": cfg["llm"]["model"],
-            "messages": messages2,
-            "stream": False,
-            "keep_alive": cfg["llm"]["keep_alive"],
-        }
+        messages2 = [{"role": "system", "content": system_prompt}] + history
         t1 = time.monotonic()
-        resp2 = _http_post(cfg["llm"]["endpoint"] + "/api/chat", payload2)
+        msg2 = llm_client.chat(messages2, cfg, log)
         log(f"LLM (confirmación) elapsed={time.monotonic() - t1:.2f}s")
-        content = resp2["message"]["content"].strip()
+        content = msg2["content"].strip()
     else:
         content = msg["content"].strip()
 
     history.append({"role": "assistant", "content": content})
     return content
-
-
-def llm_unload(cfg: dict, log) -> None:
-    """Fuerza unload del modelo para liberar VRAM antes de cargar F5-TTS.
-    Hace polling a /api/ps hasta confirmar que Ollama efectivamente liberó la GPU,
-    porque keep_alive=0 es asíncrono y tarda 1-2s en aplicarse."""
-    try:
-        _http_post(
-            cfg["llm"]["endpoint"] + "/api/generate",
-            {"model": cfg["llm"]["model"], "keep_alive": 0},
-            timeout=10,
-        )
-        log("LLM: unload requested (keep_alive=0)")
-    except Exception as e:
-        log(f"LLM: unload failed ({e})")
-        return
-
-    target = cfg["llm"]["model"]
-    endpoint = cfg["llm"]["endpoint"] + "/api/ps"
-    t0 = time.monotonic()
-    while time.monotonic() - t0 < 5.0:
-        try:
-            with urllib.request.urlopen(endpoint, timeout=2) as r:
-                data = json.loads(r.read())
-            loaded_names = [m.get("name", "") for m in data.get("models", [])]
-            if target not in loaded_names:
-                log(f"LLM: unload confirmed in {time.monotonic() - t0:.2f}s")
-                return
-        except Exception:
-            pass
-        time.sleep(0.2)
-    log(f"LLM: unload not confirmed after 5s, proceeding anyway")
 
 
 # --------- TTS (F5-Spanish) ---------
@@ -432,13 +430,10 @@ def main() -> int:
     cfg = load_config()
     log = _log_writer(Path(expand(cfg["runtime"]["log_file"])))
 
-    # SIGTERM handler: libera VRAM antes de morir (Alt+Z durante el pipeline)
+    # SIGTERM handler: salida limpia (Alt+Z durante el pipeline). Ya no hay
+    # VRAM de LLM que liberar: el modelo vive en el servidor remoto.
     def _on_sigterm(signum, frame):
-        log("SIGTERM recibido — unload LLM y salida")
-        try:
-            llm_unload(cfg, log)
-        except Exception:
-            pass
+        log("SIGTERM recibido — salida")
         sys.exit(0)
     signal.signal(signal.SIGTERM, _on_sigterm)
     t_start = time.monotonic()
@@ -460,8 +455,6 @@ def main() -> int:
         return 1
     log(f"BIRD: {assistant_text}")
     save_history(history, cfg)
-
-    llm_unload(cfg, log)
 
     out_wav = synthesize(assistant_text, cfg, log)
     if out_wav is None:

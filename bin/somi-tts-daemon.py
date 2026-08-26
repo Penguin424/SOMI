@@ -49,8 +49,15 @@ def main() -> int:
     )
     _logp(f"load: {time.monotonic() - t0:.2f}s on {tts.device}")
 
-    # Cold-store en CPU para no robar VRAM mientras no hay petición.
+    # keep_on_gpu=true: ya no hay LLM local disputando VRAM (vive en el
+    # servidor remoto), así que F5 se queda residente en GPU y nos ahorramos
+    # el swap de cada turno. keep_on_gpu=false conserva el comportamiento
+    # previo (útil si se quiere la VRAM libre para otra cosa).
+    keep_on_gpu = cfg.get("tts", {}).get("keep_on_gpu", False)
+
     def to_cpu() -> None:
+        if keep_on_gpu:
+            return
         tts.ema_model = tts.ema_model.to("cpu")
         tts.vocoder = tts.vocoder.to("cpu")
         tts.device = "cpu"
@@ -58,12 +65,20 @@ def main() -> int:
             torch.cuda.empty_cache()
 
     def to_gpu() -> None:
+        if keep_on_gpu:
+            return
         tts.ema_model = tts.ema_model.to("cuda")
         tts.vocoder = tts.vocoder.to("cuda")
         tts.device = "cuda"
 
-    to_cpu()
-    _logp("ready (model parked on CPU)")
+    if keep_on_gpu:
+        tts.ema_model = tts.ema_model.to("cuda")
+        tts.vocoder = tts.vocoder.to("cuda")
+        tts.device = "cuda"
+        _logp("ready (model parked on GPU, keep_on_gpu=true)")
+    else:
+        to_cpu()
+        _logp("ready (model parked on CPU)")
 
     if os.path.exists(SOCKET_PATH):
         os.unlink(SOCKET_PATH)

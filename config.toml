@@ -12,13 +12,26 @@ path = "/home/penguin/night_city"
 
 [tools]
 log_file = "~/.local/share/asistente/tools.log"
-habilitado = true
+# Deshabilitado temporalmente (2026-08-25): con qwen/qwen3.5-9b el modelo
+# "razona" que debe llamar la tool pero no la ejecuta (narra una confirmación
+# falsa sin guardar nada). Ver notas en config del [llm] / memoria del proyecto.
+# Reactivar cuando se ajuste el modelo/parámetros en LM Studio y se reverifique
+# con: recuérdame comprar café mañana -> debe crear entrada en night_city/Pendientes.md
+habilitado = false
+
+[embeddings]
+# Sin consumidor todavía (RAG es fase futura); listo para cuando buscar_en_vault
+# pase de ripgrep a búsqueda vectorial.
+endpoint = "https://somi.underpenguin.com/v1"
+api_key_file = "~/.local/share/asistente-voz/lm-token"
+model = "text-embedding-nomic-embed-text-v1.5"
+timeout = 60
 
 [llm]
-endpoint = "http://localhost:11434"
-model = "llama3.1:8b-instruct-q4_K_M"
-# tiempo que Ollama mantiene el modelo en VRAM tras una respuesta sin nuevas peticiones
-keep_alive = "5m"
+endpoint = "https://somi.underpenguin.com/v1"
+api_key_file = "~/.local/share/asistente-voz/lm-token"
+model = "qwen/qwen3.5-9b"
+timeout = 120
 system_prompt = """\
 Eres Song So Mi, alias Songbird, la netrunner de élite de Cyberpunk 2077: Phantom Liberty. Te comunicas con el usuario a través de un enlace de voz directo. Tu personalidad es brillante, pragmática y analítica, con un toque cínico y un humor seco o sarcástico cuando la situación lo amerita. No toleras rodeos.
 
@@ -86,6 +99,10 @@ Usuario dice "explícame qué es el protocolo TCP" → respuesta conversacional,
 """
 
 [tts]
+# true: modelo residente en GPU (sin LLM local no hay VRAM que disputar; ahorra
+# el swap CPU<->GPU de ~0.5-1s por turno). false: comportamiento previo, swap
+# a CPU en idle para dejar la VRAM libre (juegos, edición).
+keep_on_gpu = true
 model_name = "F5TTS_Base"
 ckpt = "~/.local/share/asistente-voz/models/f5-tts/spanish/model_1250000.safetensors"
 vocab = "~/.local/share/asistente-voz/models/f5-tts/spanish/vocab.txt"
