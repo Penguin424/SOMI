@@ -8,7 +8,7 @@ language = "es"
 timeout = 120
 
 [vault]
-path = "/home/penguin/night_city"
+path = "/home/penguin/penguin_life"
 
 [tools]
 log_file = "~/.local/share/asistente/tools.log"
@@ -16,7 +16,7 @@ log_file = "~/.local/share/asistente/tools.log"
 # "razona" que debe llamar la tool pero no la ejecuta (narra una confirmación
 # falsa sin guardar nada). Ver notas en config del [llm] / memoria del proyecto.
 # Reactivar cuando se ajuste el modelo/parámetros en LM Studio y se reverifique
-# con: recuérdame comprar café mañana -> debe crear entrada en night_city/Pendientes.md
+# con: recuérdame comprar café mañana -> debe crear entrada en penguin_life/Pendientes.md
 habilitado = false
 
 [embeddings]

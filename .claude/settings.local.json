@@ -1,7 +1,7 @@
 {
   "permissions": {
     "allow": [
-      "Read(//home/penguin/night_city/**)",
+      "Read(//home/penguin/penguin_life/**)",
       "Bash(~/.local/share/asistente-voz/venv/bin/python *)",
       "Bash(~/.local/share/asistente-voz/venv/bin/pip install *)",
       "Bash(claude --version)",

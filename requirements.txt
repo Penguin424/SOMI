@@ -1,0 +1,9 @@
+# Dependencias de runtime de SOMI (cliente).
+#
+# El resto es stdlib: urllib (HTTP), tomllib (config.toml), json, subprocess,
+# fcntl, struct, mimetypes, uuid... No hay cliente HTTP de terceros.
+#
+# Instalar en el venv de ~/.local/share/asistente-voz/venv (ver README.md).
+
+num2words==0.5.14   # lib/text_tts.py — números a letras antes de mandar al TTS
+PyGObject==3.56.3   # overlay/somi-overlay.py — GTK4 + Gtk4LayerShell
