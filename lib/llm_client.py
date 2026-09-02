@@ -64,6 +64,13 @@ def _post(url: str, body: dict, token: str, timeout: int) -> dict:
             raise LLMError("token inválido o ausente para el servidor LM Studio") from e
         if e.code == 404:
             raise LLMError("modelo no encontrado en el servidor LM Studio") from e
+        if e.code in (502, 503, 504):
+            # El proxy contesta pero el backend no: el cuerpo es la página HTML
+            # de error del proxy, inútil dentro de una notificación.
+            raise LLMError(
+                f"el servidor LM Studio no está arrancado (el proxy devolvió {e.code}); "
+                "enciéndelo y reintenta"
+            ) from e
         raise LLMError(f"servidor LM Studio respondió {e.code}: {body_txt}") from e
     except urllib.error.URLError as e:
         raise LLMError(f"no se pudo contactar con el servidor LM Studio: {e.reason}") from e

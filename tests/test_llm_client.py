@@ -178,6 +178,36 @@ class TestChat:
             with pytest.raises(LLMError, match="contactar"):
                 chat([{"role": "user", "content": "hola"}], cfg)
 
+    def test_502_dice_que_el_backend_no_esta_arrancado_sin_volcar_html(
+        self, tmp_path: Path
+    ) -> None:
+        """El 502 lo genera el proxy, no LM Studio: su cuerpo es una página HTML
+        que no cabe ni tiene sentido en una notificación."""
+        cfg = _cfg(tmp_path)
+        html = b"<html>\n<head><title>502 Bad Gateway</title></head>\n<body></body>\n</html>"
+
+        def fake_urlopen(req, timeout=None):
+            raise urllib.error.HTTPError(req.full_url, 502, "Bad Gateway", {}, io.BytesIO(html))
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            with pytest.raises(LLMError) as exc:
+                chat([{"role": "user", "content": "hola"}], cfg)
+
+        assert "arrancado" in str(exc.value)
+        assert "502" in str(exc.value)
+        assert "<html" not in str(exc.value)
+
+    def test_500_de_la_app_conserva_el_cuerpo_util(self, tmp_path: Path) -> None:
+        cfg = _cfg(tmp_path)
+        body = b'{"error":"model failed to load"}'
+
+        def fake_urlopen(req, timeout=None):
+            raise urllib.error.HTTPError(req.full_url, 500, "Server Error", {}, io.BytesIO(body))
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            with pytest.raises(LLMError, match="model failed to load"):
+                chat([{"role": "user", "content": "hola"}], cfg)
+
 
 class TestEmbed:
     def test_devuelve_vectores_en_orden_de_index(self, tmp_path: Path) -> None:

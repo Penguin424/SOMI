@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""SOMI pipeline: WAV -> STT (whisper.cpp) -> LLM (Ollama) -> TTS (F5-Spanish) -> paplay.
+"""SOMI pipeline: WAV -> STT (servidor de voz) -> LLM (LM Studio remoto) ->
+TTS (servidor de voz) -> paplay.
 
 Uso: pipeline.py <wav_file>
 """
@@ -10,7 +11,6 @@ import json
 import os
 import shutil
 import signal
-import socket
 import subprocess
 import sys
 import time
@@ -22,9 +22,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import llm_client
+import voice_api
 
 CONFIG_PATH = Path(__file__).parent.parent / "config.toml"
-TTS_SOCKET = "/tmp/somi-tts.sock"
 
 SILENCE_MARKERS = (
     "[BLANK_AUDIO]", "[blank_audio]",
@@ -32,6 +32,11 @@ SILENCE_MARKERS = (
     "(música)", "[Música]", "[música]",
     "(music)", "[Music]", "[music]",
     "(silence)", "[silence]",
+    # Alucinaciones típicas de whisper-small sobre audio mudo/ruido — el
+    # modelo `small` remoto las produce más que el `medium` local anterior.
+    "Subtítulos realizados por la comunidad de Amara.org",
+    "¡Gracias por ver el video!",
+    "Gracias por ver el vídeo",
 )
 
 
@@ -70,32 +75,16 @@ def _log_writer(path: Path):
     return write
 
 
-# --------- STT ---------
+# --------- STT (servidor de voz remoto) ---------
 def transcribe(wav: Path, cfg: dict, log) -> str | None:
-    out_prefix = wav.parent / wav.stem
-    cmd = [
-        expand(cfg["stt"]["whisper_bin"]),
-        "-m", expand(cfg["stt"]["whisper_model"]),
-        "-f", str(wav),
-        "-l", cfg["stt"]["language"],
-        "-t", str(cfg["stt"]["threads"]),
-        "--no-prints",
-        "--output-txt",
-        "--output-file", str(out_prefix),
-    ]
-    log(f"STT cmd: {' '.join(cmd)}")
     t0 = time.monotonic()
-    proc = subprocess.run(cmd, capture_output=True, text=True)
-    log(f"STT elapsed={time.monotonic() - t0:.2f}s rc={proc.returncode}")
-    if proc.returncode != 0:
-        log(f"STT stderr: {proc.stderr[-400:]}")
-        return None
-    txt_file = Path(str(out_prefix) + ".txt")
-    if not txt_file.exists():
-        log("STT: no txt file produced")
-        return None
-    text = txt_file.read_text(encoding="utf-8").strip()
-    txt_file.unlink(missing_ok=True)
+    try:
+        text = voice_api.transcribir(wav, cfg, log)
+    except voice_api.VoiceAPIError as e:
+        log(f"STT error: {e}")
+        raise
+    log(f"STT elapsed={time.monotonic() - t0:.2f}s")
+    text = (text or "").strip()
     if not text or len(text) < 3 or any(m in text for m in SILENCE_MARKERS):
         log(f"STT silence/no-voice: '{text}'")
         return None
@@ -248,135 +237,7 @@ def llm_chat(history: list[dict], user_text: str, cfg: dict, log) -> str:
     return content
 
 
-# --------- TTS (F5-Spanish) ---------
-def _seed_from_cfg(cfg: dict) -> int | None:
-    v = cfg["tts"].get("seed", "")
-    if isinstance(v, (int, float)):
-        return int(v)
-    if isinstance(v, str) and v.strip():
-        try:
-            return int(v.strip())
-        except ValueError:
-            return None
-    return None
-
-
-def _synthesize_via_daemon(text: str, cfg: dict, log, out_path: Path, ref_text: str) -> Path | None:
-    """Si /tmp/somi-tts.sock existe, manda la petición al daemon F5-TTS."""
-    if not Path(TTS_SOCKET).exists():
-        return None
-    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    sock.settimeout(120.0)
-    try:
-        sock.connect(TTS_SOCKET)
-    except OSError as e:
-        log(f"TTS daemon socket present but unreachable ({e})")
-        return None
-
-    req = {
-        "ref_audio": expand(cfg["tts"]["ref_audio"]),
-        "ref_text": ref_text,
-        "gen_text": text,
-        "out_path": str(out_path),
-        "seed": _seed_from_cfg(cfg),
-        "nfe_step": cfg["tts"].get("nfe_step", 32),
-        "cfg_strength": cfg["tts"].get("cfg_strength", 2.0),
-        "speed": cfg["tts"].get("speed", 1.0),
-    }
-    log(f"TTS (daemon): gen='{text[:80]}'")
-    t0 = time.monotonic()
-    try:
-        sock.sendall((json.dumps(req) + "\n").encode("utf-8"))
-        buf = bytearray()
-        while True:
-            chunk = sock.recv(8192)
-            if not chunk:
-                break
-            buf.extend(chunk)
-            if buf.endswith(b"\n"):
-                break
-        resp = json.loads(buf.decode("utf-8"))
-    except Exception as e:
-        log(f"TTS daemon comm error: {e}")
-        return None
-    finally:
-        try:
-            sock.close()
-        except Exception:
-            pass
-
-    if resp.get("status") != "ok":
-        log(f"TTS daemon returned error: {resp.get('error')}")
-        return None
-    t = resp.get("timings", {})
-    log(
-        f"TTS (daemon) total={time.monotonic() - t0:.2f}s "
-        f"swap_in={t.get('swap_in')} infer={t.get('infer')} swap_out={t.get('swap_out')} "
-        f"dur={resp.get('dur_s'):.2f}s"
-    )
-    return out_path
-
-
-def _synthesize_cold(text: str, cfg: dict, log, out_path: Path, ref_text: str) -> Path | None:
-    """Fallback: importa F5-TTS y genera en el proceso actual (cold start ~9s)."""
-    t_import = time.monotonic()
-    from f5_tts.api import F5TTS
-    import soundfile as sf
-    log(f"TTS (cold) import={time.monotonic() - t_import:.2f}s")
-
-    t_load = time.monotonic()
-    tts = F5TTS(
-        model=cfg["tts"]["model_name"],
-        ckpt_file=expand(cfg["tts"]["ckpt"]),
-        vocab_file=expand(cfg["tts"]["vocab"]),
-    )
-    log(f"TTS (cold) load={time.monotonic() - t_load:.2f}s")
-
-    seed = _seed_from_cfg(cfg)
-    log(f"TTS (cold): gen='{text[:80]}' seed={seed}")
-    t_infer = time.monotonic()
-    try:
-        wav, sr, _ = tts.infer(
-            ref_file=expand(cfg["tts"]["ref_audio"]),
-            ref_text=ref_text,
-            gen_text=text,
-            seed=seed,
-            nfe_step=cfg["tts"].get("nfe_step", 32),
-            cfg_strength=cfg["tts"].get("cfg_strength", 2.0),
-            speed=cfg["tts"].get("speed", 1.0),
-            show_info=lambda *a, **k: None,
-            progress=None,
-        )
-    except Exception as e:
-        log(f"TTS (cold) error: {e}")
-        return None
-    log(f"TTS (cold) infer={time.monotonic() - t_infer:.2f}s dur={len(wav)/sr:.2f}s")
-    sf.write(str(out_path), wav, sr)
-    return out_path
-
-
-def synthesize(text: str, cfg: dict, log) -> Path | None:
-    """Genera audio. Intenta daemon primero, cae a cold-start si no responde."""
-    from text_tts import normalizar_para_tts
-
-    ref_text = Path(expand(cfg["tts"]["ref_text_file"])).read_text(encoding="utf-8").strip()
-    out_path = Path(expand(cfg["runtime"]["response_wav"]))
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    if out_path.exists():
-        out_path.unlink()
-
-    text_norm = normalizar_para_tts(text)
-    if text_norm != text:
-        log(f"TTS normalizado: '{text_norm[:80]}'")
-    text = text_norm
-
-    result = _synthesize_via_daemon(text, cfg, log, out_path, ref_text)
-    if result is not None:
-        return result
-    log("TTS: daemon no disponible, fallback a cold start")
-    return _synthesize_cold(text, cfg, log, out_path, ref_text)
-
-
+# --------- TTS (servidor de voz remoto) ---------
 _OVERLAY_SCRIPT = Path(__file__).parent.parent / "overlay" / "somi-overlay.py"
 _LAYER_SHELL_SO  = "/usr/lib/libgtk4-layer-shell.so"
 
@@ -385,6 +246,79 @@ def play(wav: Path) -> None:
     overlay = _launch_overlay()
     subprocess.run(["paplay", str(wav)], check=False)
     _kill_overlay(overlay)
+
+
+def hablar(text: str, cfg: dict, log) -> bool:
+    """Sintetiza y reproduce la respuesta.
+
+    En modo streaming (default) sintetiza y reproduce a la vez: el overlay
+    aparece al llegar el primer trozo de audio, no antes de empezar la
+    petición. Devuelve False si el servidor de voz falla."""
+    from text_tts import normalizar_para_tts
+
+    text_norm = normalizar_para_tts(text)
+    if text_norm != text:
+        log(f"TTS normalizado: '{text_norm[:80]}'")
+    text = text_norm
+
+    if cfg["tts"].get("stream", True):
+        return _hablar_stream(text, cfg, log)
+    return _hablar_wav(text, cfg, log)
+
+
+def _hablar_stream(text: str, cfg: dict, log) -> bool:
+    try:
+        fmt, trozos = voice_api.abrir_stream(text, cfg, log)
+    except voice_api.VoiceAPIError as e:
+        log(f"TTS error: {e}")
+        return False
+
+    proc = subprocess.Popen(
+        [
+            "paplay", "--raw",
+            f"--rate={fmt['rate']}",
+            f"--channels={fmt['channels']}",
+            "--format=s16le",
+        ],
+        stdin=subprocess.PIPE,
+    )
+    overlay = None
+    t0 = time.monotonic()
+    ok = True
+    try:
+        for i, trozo in enumerate(trozos):
+            if i == 0:
+                log(f"TTS (stream) primer audio a los {time.monotonic() - t0:.2f}s")
+                overlay = _launch_overlay()
+            proc.stdin.write(trozo)
+    except voice_api.VoiceAPIError as e:
+        log(f"TTS error durante el stream: {e}")
+        ok = False
+    except BrokenPipeError:
+        log("TTS: paplay cerró stdin (¿turno cancelado?)")
+        ok = False
+    finally:
+        try:
+            proc.stdin.close()
+        except Exception:
+            pass
+        proc.wait()
+        _kill_overlay(overlay)
+    return ok
+
+
+def _hablar_wav(text: str, cfg: dict, log) -> bool:
+    out_path = Path(expand(cfg["runtime"]["response_wav"]))
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    if out_path.exists():
+        out_path.unlink()
+    try:
+        voice_api.descargar_wav(text, cfg, log, out_path)
+    except voice_api.VoiceAPIError as e:
+        log(f"TTS error: {e}")
+        return False
+    play(out_path)
+    return True
 
 
 def _launch_overlay() -> subprocess.Popen | None:
@@ -439,7 +373,12 @@ def main() -> int:
     t_start = time.monotonic()
     log("==================== turn start ====================")
 
-    user_text = transcribe(wav, cfg, log)
+    try:
+        user_text = transcribe(wav, cfg, log)
+    except voice_api.VoiceAPIError as e:
+        notify("❌ STT falló", str(e)[:120], urgency="critical")
+        log(f"abort: STT error: {e}")
+        return 1
     if user_text is None:
         notify("🤷 No te oí", "Vuelve a pulsar e intenta de nuevo")
         log("abort: STT empty/silence")
@@ -456,13 +395,15 @@ def main() -> int:
     log(f"BIRD: {assistant_text}")
     save_history(history, cfg)
 
-    out_wav = synthesize(assistant_text, cfg, log)
-    if out_wav is None:
+    # El log de "turn total" mide STT+LLM (el trabajo antes de que se oiga
+    # nada); la reproducción/streaming va después y no cuenta como parte del
+    # "proceso" en sí.
+    log(f"turn total={time.monotonic() - t_start:.2f}s")
+
+    if not hablar(assistant_text, cfg, log):
         notify("❌ TTS falló", "Mira logs/pipeline.log", urgency="critical")
         return 1
 
-    log(f"turn total={time.monotonic() - t_start:.2f}s")
-    play(out_wav)
     return 0
 
 

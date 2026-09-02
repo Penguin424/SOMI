@@ -2,10 +2,10 @@
 # Edita aquí los paths, el prompt o los modelos. El pipeline lo relee en cada turno.
 
 [stt]
-whisper_bin = "~/.local/share/asistente-voz/build/whisper.cpp/build/bin/whisper-cli"
-whisper_model = "~/.local/share/asistente-voz/models/whisper/ggml-medium.bin"
+endpoint = "https://chat-somi.underpenguin.com/v1"
+api_key_file = "~/.local/share/asistente-voz/voice-api-token"
 language = "es"
-threads = 8
+timeout = 120
 
 [vault]
 path = "/home/penguin/night_city"
@@ -99,21 +99,11 @@ Usuario dice "explícame qué es el protocolo TCP" → respuesta conversacional,
 """
 
 [tts]
-# true: modelo residente en GPU (sin LLM local no hay VRAM que disputar; ahorra
-# el swap CPU<->GPU de ~0.5-1s por turno). false: comportamiento previo, swap
-# a CPU en idle para dejar la VRAM libre (juegos, edición).
-keep_on_gpu = true
-model_name = "F5TTS_Base"
-ckpt = "~/.local/share/asistente-voz/models/f5-tts/spanish/model_1250000.safetensors"
-vocab = "~/.local/share/asistente-voz/models/f5-tts/spanish/vocab.txt"
-ref_audio = "~/.local/share/asistente-voz/models/f5-tts/reference-voice.wav"
-ref_text_file = "~/.local/share/asistente-voz/models/f5-tts/reference-voice.txt"
-# Parámetros de inferencia. Ajustables sin tocar código.
-# seed: entero fijo → output reproducible; vacío "" → aleatorio
-seed = 42
-nfe_step = 50       # 32 default. 40 estable, 50+ aún más fiel; 24 más rápido
-cfg_strength = 2.0   # 2.0 default. Más alto = más fiel al texto, menos expresivo
-speed = 1.1          # 1.0 = velocidad natural. <1 lento, >1 rápido. Subido a 1.1 para dicción más ágil
+endpoint = "https://chat-somi.underpenguin.com/v1"
+api_key_file = "~/.local/share/asistente-voz/voice-api-token"
+voice = "somi"
+stream = true      # false = descarga el wav completo y lo reproduce con paplay
+timeout = 300      # el stream completo puede pasar de 60s en textos largos
 
 [history]
 file = "~/.local/share/asistente-voz/data/conversation.json"

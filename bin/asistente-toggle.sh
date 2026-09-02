@@ -21,7 +21,8 @@ WAV_FILE="$TMP_DIR/recording.wav"
 LOG_FILE="$LOG_DIR/toggle.log"
 PIPELINE_LOG="$LOG_DIR/pipeline-runtime.log"
 PIPELINE_PY="$HOME/Documents/projects/python/SOMI/lib/pipeline.py"
-# Python del venv: tiene f5_tts y soundfile instalados
+# Python del venv (num2words para la normalización de TTS; STT/TTS ya no
+# corren en local, van al servidor de voz remoto)
 VENV_PYTHON="$HOME/.local/share/asistente-voz/venv/bin/python"
 
 mkdir -p "$TMP_DIR" "$LOG_DIR"
