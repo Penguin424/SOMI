@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""SOMI pipeline: WAV -> STT (whisper.cpp) -> LLM (Ollama) -> TTS (F5-Spanish) -> paplay.
+"""SOMI pipeline: WAV -> STT (servidor de voz) -> LLM (LM Studio remoto) ->
+TTS (servidor de voz) -> paplay.
 
 Uso: pipeline.py <wav_file>
 """
@@ -10,21 +11,20 @@ import json
 import os
 import shutil
 import signal
-import socket
 import subprocess
 import sys
 import time
 import tomllib
-import urllib.error
-import urllib.request
 from datetime import datetime
 from pathlib import Path
 
 # Hace importable el directorio tools/ que está en la raíz del proyecto
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+import llm_client
+import voice_api
+
 CONFIG_PATH = Path(__file__).parent.parent / "config.toml"
-TTS_SOCKET = "/tmp/somi-tts.sock"
 
 SILENCE_MARKERS = (
     "[BLANK_AUDIO]", "[blank_audio]",
@@ -32,6 +32,11 @@ SILENCE_MARKERS = (
     "(música)", "[Música]", "[música]",
     "(music)", "[Music]", "[music]",
     "(silence)", "[silence]",
+    # Alucinaciones típicas de whisper-small sobre audio mudo/ruido — el
+    # modelo `small` remoto las produce más que el `medium` local anterior.
+    "Subtítulos realizados por la comunidad de Amara.org",
+    "¡Gracias por ver el video!",
+    "Gracias por ver el vídeo",
 )
 
 
@@ -70,32 +75,16 @@ def _log_writer(path: Path):
     return write
 
 
-# --------- STT ---------
+# --------- STT (servidor de voz remoto) ---------
 def transcribe(wav: Path, cfg: dict, log) -> str | None:
-    out_prefix = wav.parent / wav.stem
-    cmd = [
-        expand(cfg["stt"]["whisper_bin"]),
-        "-m", expand(cfg["stt"]["whisper_model"]),
-        "-f", str(wav),
-        "-l", cfg["stt"]["language"],
-        "-t", str(cfg["stt"]["threads"]),
-        "--no-prints",
-        "--output-txt",
-        "--output-file", str(out_prefix),
-    ]
-    log(f"STT cmd: {' '.join(cmd)}")
     t0 = time.monotonic()
-    proc = subprocess.run(cmd, capture_output=True, text=True)
-    log(f"STT elapsed={time.monotonic() - t0:.2f}s rc={proc.returncode}")
-    if proc.returncode != 0:
-        log(f"STT stderr: {proc.stderr[-400:]}")
-        return None
-    txt_file = Path(str(out_prefix) + ".txt")
-    if not txt_file.exists():
-        log("STT: no txt file produced")
-        return None
-    text = txt_file.read_text(encoding="utf-8").strip()
-    txt_file.unlink(missing_ok=True)
+    try:
+        text = voice_api.transcribir(wav, cfg, log)
+    except voice_api.VoiceAPIError as e:
+        log(f"STT error: {e}")
+        raise
+    log(f"STT elapsed={time.monotonic() - t0:.2f}s")
+    text = (text or "").strip()
     if not text or len(text) < 3 or any(m in text for m in SILENCE_MARKERS):
         log(f"STT silence/no-voice: '{text}'")
         return None
@@ -119,11 +108,30 @@ def load_history(cfg: dict, log) -> list[dict]:
     try:
         with open(hist_file, encoding="utf-8") as f:
             data = json.load(f)
+        if _es_formato_ollama_viejo(data):
+            rot_dir = Path(expand(cfg["history"]["rotated_dir"]))
+            rot_dir.mkdir(parents=True, exist_ok=True)
+            target = rot_dir / f"conversation-{datetime.now().strftime('%Y%m%d-%H%M%S')}.json"
+            shutil.move(str(hist_file), str(target))
+            log(f"history: formato Ollama antiguo detectado, rotado -> {target.name}")
+            return []
         log(f"history: loaded {len(data)} messages (age {age_min:.1f}min)")
         return data
     except Exception as e:
         log(f"history: corrupt ({e}), starting fresh")
         return []
+
+
+def _es_formato_ollama_viejo(data: list[dict]) -> bool:
+    """Detecta historiales guardados antes de migrar a LM Studio: los mensajes
+    de tool_calls/tool ahí no llevan "id"/"tool_call_id" (la API OpenAI sí los exige)."""
+    for msg in data:
+        if msg.get("role") == "assistant" and msg.get("tool_calls"):
+            if any("id" not in tc for tc in msg["tool_calls"]):
+                return True
+        if msg.get("role") == "tool" and "tool_call_id" not in msg:
+            return True
+    return False
 
 
 def save_history(history: list[dict], cfg: dict) -> None:
@@ -133,40 +141,55 @@ def save_history(history: list[dict], cfg: dict) -> None:
         json.dump(history, f, ensure_ascii=False, indent=2)
 
 
-# --------- LLM (Ollama) ---------
-def _http_post(url: str, body: dict, timeout: int = 120) -> dict:
-    data = json.dumps(body).encode("utf-8")
-    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read())
+_DIAS_ES = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"]
+_MESES_ES = [
+    "enero", "febrero", "marzo", "abril", "mayo", "junio",
+    "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre",
+]
 
 
+def _system_prompt_con_fecha(cfg: dict) -> str:
+    """Inyecta la fecha/hora actual en el system prompt.
+
+    Sin esto, tools como agregar_pendiente/calificar_media (que piden fechas
+    en YYYY-MM-DD) no tienen forma de resolver expresiones relativas como
+    "mañana": el modelo se queda deliberando cómo calcular la fecha y termina
+    abandonando la llamada a la tool, devolviendo solo una confirmación
+    verbal sin haber guardado nada."""
+    ahora = datetime.now()
+    dia_semana = _DIAS_ES[ahora.weekday()]
+    mes = _MESES_ES[ahora.month - 1]
+    fecha_legible = f"{dia_semana} {ahora.day} de {mes} de {ahora.year}"
+    linea_fecha = (
+        f"\n\nFecha y hora actual: {fecha_legible}, {ahora.strftime('%H:%M')} "
+        f"(ISO: {ahora.strftime('%Y-%m-%d')}). Úsala para calcular fechas relativas "
+        f'como "mañana", "el viernes" o "la próxima semana" en formato YYYY-MM-DD.'
+    )
+    return cfg["llm"]["system_prompt"] + linea_fecha
+
+
+# --------- LLM (LM Studio remoto) ---------
 def llm_chat(history: list[dict], user_text: str, cfg: dict, log) -> str:
     history.append({"role": "user", "content": user_text})
-    messages = [{"role": "system", "content": cfg["llm"]["system_prompt"]}] + history
-
-    payload: dict = {
-        "model": cfg["llm"]["model"],
-        "messages": messages,
-        "stream": False,
-        "keep_alive": cfg["llm"]["keep_alive"],
-    }
+    system_prompt = _system_prompt_con_fecha(cfg)
+    messages = [{"role": "system", "content": system_prompt}] + history
 
     tools_habilitado = cfg.get("tools", {}).get("habilitado", False)
+    tool_schemas = None
     if tools_habilitado:
         from tools.registry import schemas_para_ollama, ejecutar_tool
-        payload["tools"] = schemas_para_ollama()
+        tool_schemas = schemas_para_ollama()
 
     log(f"LLM: msgs={len(messages)} user='{user_text[:80]}' tools={tools_habilitado}")
     t0 = time.monotonic()
-    resp = _http_post(cfg["llm"]["endpoint"] + "/api/chat", payload)
+    msg = llm_client.chat(messages, cfg, log, tools=tool_schemas)
     log(f"LLM elapsed={time.monotonic() - t0:.2f}s")
 
-    msg = resp["message"]
     tool_calls: list = msg.get("tool_calls") or []
 
     if tools_habilitado and tool_calls:
         # Guarda el turno del asistente con sus tool_calls en el historial
+        # (formato OpenAI: cada llamada trae su propio "id")
         history.append({
             "role": "assistant",
             "content": msg.get("content") or "",
@@ -185,7 +208,7 @@ def llm_chat(history: list[dict], user_text: str, cfg: dict, log) -> str:
             resultado = ejecutar_tool(nombre, args, cfg)
             log(f"TOOL: {nombre} -> status={resultado.get('status')}")
             # Cuando hay error lo expresamos en lenguaje natural para que el modelo
-            # no lo ignore — Llama 3.1 tiende a pasar por alto el campo status=error
+            # no lo ignore — algunos modelos tienden a pasar por alto el campo status=error
             if resultado.get("status") == "error":
                 tool_content = (
                     f"La herramienta {nombre} falló con el siguiente error: "
@@ -196,21 +219,17 @@ def llm_chat(history: list[dict], user_text: str, cfg: dict, log) -> str:
                 tool_content = json.dumps(resultado, ensure_ascii=False)
             history.append({
                 "role": "tool",
+                "tool_call_id": llamada["id"],
+                "name": nombre,
                 "content": tool_content,
             })
 
         # Segunda llamada: el modelo genera la confirmación verbal
-        messages2 = [{"role": "system", "content": cfg["llm"]["system_prompt"]}] + history
-        payload2 = {
-            "model": cfg["llm"]["model"],
-            "messages": messages2,
-            "stream": False,
-            "keep_alive": cfg["llm"]["keep_alive"],
-        }
+        messages2 = [{"role": "system", "content": system_prompt}] + history
         t1 = time.monotonic()
-        resp2 = _http_post(cfg["llm"]["endpoint"] + "/api/chat", payload2)
+        msg2 = llm_client.chat(messages2, cfg, log)
         log(f"LLM (confirmación) elapsed={time.monotonic() - t1:.2f}s")
-        content = resp2["message"]["content"].strip()
+        content = msg2["content"].strip()
     else:
         content = msg["content"].strip()
 
@@ -218,167 +237,7 @@ def llm_chat(history: list[dict], user_text: str, cfg: dict, log) -> str:
     return content
 
 
-def llm_unload(cfg: dict, log) -> None:
-    """Fuerza unload del modelo para liberar VRAM antes de cargar F5-TTS.
-    Hace polling a /api/ps hasta confirmar que Ollama efectivamente liberó la GPU,
-    porque keep_alive=0 es asíncrono y tarda 1-2s en aplicarse."""
-    try:
-        _http_post(
-            cfg["llm"]["endpoint"] + "/api/generate",
-            {"model": cfg["llm"]["model"], "keep_alive": 0},
-            timeout=10,
-        )
-        log("LLM: unload requested (keep_alive=0)")
-    except Exception as e:
-        log(f"LLM: unload failed ({e})")
-        return
-
-    target = cfg["llm"]["model"]
-    endpoint = cfg["llm"]["endpoint"] + "/api/ps"
-    t0 = time.monotonic()
-    while time.monotonic() - t0 < 5.0:
-        try:
-            with urllib.request.urlopen(endpoint, timeout=2) as r:
-                data = json.loads(r.read())
-            loaded_names = [m.get("name", "") for m in data.get("models", [])]
-            if target not in loaded_names:
-                log(f"LLM: unload confirmed in {time.monotonic() - t0:.2f}s")
-                return
-        except Exception:
-            pass
-        time.sleep(0.2)
-    log(f"LLM: unload not confirmed after 5s, proceeding anyway")
-
-
-# --------- TTS (F5-Spanish) ---------
-def _seed_from_cfg(cfg: dict) -> int | None:
-    v = cfg["tts"].get("seed", "")
-    if isinstance(v, (int, float)):
-        return int(v)
-    if isinstance(v, str) and v.strip():
-        try:
-            return int(v.strip())
-        except ValueError:
-            return None
-    return None
-
-
-def _synthesize_via_daemon(text: str, cfg: dict, log, out_path: Path, ref_text: str) -> Path | None:
-    """Si /tmp/somi-tts.sock existe, manda la petición al daemon F5-TTS."""
-    if not Path(TTS_SOCKET).exists():
-        return None
-    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    sock.settimeout(120.0)
-    try:
-        sock.connect(TTS_SOCKET)
-    except OSError as e:
-        log(f"TTS daemon socket present but unreachable ({e})")
-        return None
-
-    req = {
-        "ref_audio": expand(cfg["tts"]["ref_audio"]),
-        "ref_text": ref_text,
-        "gen_text": text,
-        "out_path": str(out_path),
-        "seed": _seed_from_cfg(cfg),
-        "nfe_step": cfg["tts"].get("nfe_step", 32),
-        "cfg_strength": cfg["tts"].get("cfg_strength", 2.0),
-        "speed": cfg["tts"].get("speed", 1.0),
-    }
-    log(f"TTS (daemon): gen='{text[:80]}'")
-    t0 = time.monotonic()
-    try:
-        sock.sendall((json.dumps(req) + "\n").encode("utf-8"))
-        buf = bytearray()
-        while True:
-            chunk = sock.recv(8192)
-            if not chunk:
-                break
-            buf.extend(chunk)
-            if buf.endswith(b"\n"):
-                break
-        resp = json.loads(buf.decode("utf-8"))
-    except Exception as e:
-        log(f"TTS daemon comm error: {e}")
-        return None
-    finally:
-        try:
-            sock.close()
-        except Exception:
-            pass
-
-    if resp.get("status") != "ok":
-        log(f"TTS daemon returned error: {resp.get('error')}")
-        return None
-    t = resp.get("timings", {})
-    log(
-        f"TTS (daemon) total={time.monotonic() - t0:.2f}s "
-        f"swap_in={t.get('swap_in')} infer={t.get('infer')} swap_out={t.get('swap_out')} "
-        f"dur={resp.get('dur_s'):.2f}s"
-    )
-    return out_path
-
-
-def _synthesize_cold(text: str, cfg: dict, log, out_path: Path, ref_text: str) -> Path | None:
-    """Fallback: importa F5-TTS y genera en el proceso actual (cold start ~9s)."""
-    t_import = time.monotonic()
-    from f5_tts.api import F5TTS
-    import soundfile as sf
-    log(f"TTS (cold) import={time.monotonic() - t_import:.2f}s")
-
-    t_load = time.monotonic()
-    tts = F5TTS(
-        model=cfg["tts"]["model_name"],
-        ckpt_file=expand(cfg["tts"]["ckpt"]),
-        vocab_file=expand(cfg["tts"]["vocab"]),
-    )
-    log(f"TTS (cold) load={time.monotonic() - t_load:.2f}s")
-
-    seed = _seed_from_cfg(cfg)
-    log(f"TTS (cold): gen='{text[:80]}' seed={seed}")
-    t_infer = time.monotonic()
-    try:
-        wav, sr, _ = tts.infer(
-            ref_file=expand(cfg["tts"]["ref_audio"]),
-            ref_text=ref_text,
-            gen_text=text,
-            seed=seed,
-            nfe_step=cfg["tts"].get("nfe_step", 32),
-            cfg_strength=cfg["tts"].get("cfg_strength", 2.0),
-            speed=cfg["tts"].get("speed", 1.0),
-            show_info=lambda *a, **k: None,
-            progress=None,
-        )
-    except Exception as e:
-        log(f"TTS (cold) error: {e}")
-        return None
-    log(f"TTS (cold) infer={time.monotonic() - t_infer:.2f}s dur={len(wav)/sr:.2f}s")
-    sf.write(str(out_path), wav, sr)
-    return out_path
-
-
-def synthesize(text: str, cfg: dict, log) -> Path | None:
-    """Genera audio. Intenta daemon primero, cae a cold-start si no responde."""
-    from text_tts import normalizar_para_tts
-
-    ref_text = Path(expand(cfg["tts"]["ref_text_file"])).read_text(encoding="utf-8").strip()
-    out_path = Path(expand(cfg["runtime"]["response_wav"]))
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    if out_path.exists():
-        out_path.unlink()
-
-    text_norm = normalizar_para_tts(text)
-    if text_norm != text:
-        log(f"TTS normalizado: '{text_norm[:80]}'")
-    text = text_norm
-
-    result = _synthesize_via_daemon(text, cfg, log, out_path, ref_text)
-    if result is not None:
-        return result
-    log("TTS: daemon no disponible, fallback a cold start")
-    return _synthesize_cold(text, cfg, log, out_path, ref_text)
-
-
+# --------- TTS (servidor de voz remoto) ---------
 _OVERLAY_SCRIPT = Path(__file__).parent.parent / "overlay" / "somi-overlay.py"
 _LAYER_SHELL_SO  = "/usr/lib/libgtk4-layer-shell.so"
 
@@ -387,6 +246,79 @@ def play(wav: Path) -> None:
     overlay = _launch_overlay()
     subprocess.run(["paplay", str(wav)], check=False)
     _kill_overlay(overlay)
+
+
+def hablar(text: str, cfg: dict, log) -> bool:
+    """Sintetiza y reproduce la respuesta.
+
+    En modo streaming (default) sintetiza y reproduce a la vez: el overlay
+    aparece al llegar el primer trozo de audio, no antes de empezar la
+    petición. Devuelve False si el servidor de voz falla."""
+    from text_tts import normalizar_para_tts
+
+    text_norm = normalizar_para_tts(text)
+    if text_norm != text:
+        log(f"TTS normalizado: '{text_norm[:80]}'")
+    text = text_norm
+
+    if cfg["tts"].get("stream", True):
+        return _hablar_stream(text, cfg, log)
+    return _hablar_wav(text, cfg, log)
+
+
+def _hablar_stream(text: str, cfg: dict, log) -> bool:
+    try:
+        fmt, trozos = voice_api.abrir_stream(text, cfg, log)
+    except voice_api.VoiceAPIError as e:
+        log(f"TTS error: {e}")
+        return False
+
+    proc = subprocess.Popen(
+        [
+            "paplay", "--raw",
+            f"--rate={fmt['rate']}",
+            f"--channels={fmt['channels']}",
+            "--format=s16le",
+        ],
+        stdin=subprocess.PIPE,
+    )
+    overlay = None
+    t0 = time.monotonic()
+    ok = True
+    try:
+        for i, trozo in enumerate(trozos):
+            if i == 0:
+                log(f"TTS (stream) primer audio a los {time.monotonic() - t0:.2f}s")
+                overlay = _launch_overlay()
+            proc.stdin.write(trozo)
+    except voice_api.VoiceAPIError as e:
+        log(f"TTS error durante el stream: {e}")
+        ok = False
+    except BrokenPipeError:
+        log("TTS: paplay cerró stdin (¿turno cancelado?)")
+        ok = False
+    finally:
+        try:
+            proc.stdin.close()
+        except Exception:
+            pass
+        proc.wait()
+        _kill_overlay(overlay)
+    return ok
+
+
+def _hablar_wav(text: str, cfg: dict, log) -> bool:
+    out_path = Path(expand(cfg["runtime"]["response_wav"]))
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    if out_path.exists():
+        out_path.unlink()
+    try:
+        voice_api.descargar_wav(text, cfg, log, out_path)
+    except voice_api.VoiceAPIError as e:
+        log(f"TTS error: {e}")
+        return False
+    play(out_path)
+    return True
 
 
 def _launch_overlay() -> subprocess.Popen | None:
@@ -432,19 +364,21 @@ def main() -> int:
     cfg = load_config()
     log = _log_writer(Path(expand(cfg["runtime"]["log_file"])))
 
-    # SIGTERM handler: libera VRAM antes de morir (Alt+Z durante el pipeline)
+    # SIGTERM handler: salida limpia (Alt+Z durante el pipeline). Ya no hay
+    # VRAM de LLM que liberar: el modelo vive en el servidor remoto.
     def _on_sigterm(signum, frame):
-        log("SIGTERM recibido — unload LLM y salida")
-        try:
-            llm_unload(cfg, log)
-        except Exception:
-            pass
+        log("SIGTERM recibido — salida")
         sys.exit(0)
     signal.signal(signal.SIGTERM, _on_sigterm)
     t_start = time.monotonic()
     log("==================== turn start ====================")
 
-    user_text = transcribe(wav, cfg, log)
+    try:
+        user_text = transcribe(wav, cfg, log)
+    except voice_api.VoiceAPIError as e:
+        notify("❌ STT falló", str(e)[:120], urgency="critical")
+        log(f"abort: STT error: {e}")
+        return 1
     if user_text is None:
         notify("🤷 No te oí", "Vuelve a pulsar e intenta de nuevo")
         log("abort: STT empty/silence")
@@ -461,15 +395,15 @@ def main() -> int:
     log(f"BIRD: {assistant_text}")
     save_history(history, cfg)
 
-    llm_unload(cfg, log)
+    # El log de "turn total" mide STT+LLM (el trabajo antes de que se oiga
+    # nada); la reproducción/streaming va después y no cuenta como parte del
+    # "proceso" en sí.
+    log(f"turn total={time.monotonic() - t_start:.2f}s")
 
-    out_wav = synthesize(assistant_text, cfg, log)
-    if out_wav is None:
+    if not hablar(assistant_text, cfg, log):
         notify("❌ TTS falló", "Mira logs/pipeline.log", urgency="critical")
         return 1
 
-    log(f"turn total={time.monotonic() - t_start:.2f}s")
-    play(out_wav)
     return 0
 
 

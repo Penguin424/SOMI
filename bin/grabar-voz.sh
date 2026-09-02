@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
-# Graba una muestra de voz para F5-TTS desde el micrófono por defecto (PipeWire).
+# Graba una muestra de voz desde el micrófono por defecto (PipeWire).
 # Salida: ~/.local/share/asistente-voz/models/f5-tts/reference-voice.wav (24kHz mono S16LE).
+#
+# NOTA: el TTS ya no corre en local (F5-TTS) — la voz clonada vive en el
+# servidor remoto (chat-somi.underpenguin.com). Para registrar una voz nueva
+# ahí, sube este wav con POST /v1/voices (ver README.md). Este script queda
+# solo para producir el wav de referencia.
 
 set -euo pipefail
 

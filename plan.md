@@ -159,6 +159,13 @@ Definir en `config.toml` un system prompt que:
 - ❌ Streaming de TTS por ahora (puede ser una v2)
 - ❌ Múltiples idiomas — solo español por ahora
 
+**Actualización (2026-08-27):** STT, LLM y TTS pasaron a correr en un servidor
+de voz propio (LAN/VPS, `chat-somi.underpenguin.com` + `somi.underpenguin.com`,
+ver `README.md`) en vez de en la GPU local. Esto contradice el criterio de
+"offline 100%" de abajo y el streaming de TTS ya está activo por defecto — el
+resto de restricciones (sin GUI residente, sin wake word, sin nube de terceros:
+es infraestructura propia) se mantiene.
+
 ## Preguntas abiertas a resolver durante implementación
 
 1. ¿Conviene un servicio systemd-user para el pipeline Python que escuche un socket, o lanzar Python en cada invocación? (cold start vs proceso residente — evaluar trade-off)
